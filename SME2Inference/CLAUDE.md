@@ -34,6 +34,7 @@ Not tested yet:
 | `Tools/export_coreml_mlp.py` | Exports the same MLP to `MLPBench.mlpackage` (needs torch + coremltools) |
 | `Tools/sustained_main.swift` | Mac-only single-unit flat-out load generator for power measurement (outside the app target) |
 | `Tools/measure_power.sh` | Mac-only `powermetrics` wrapper that reports per-unit power (CPU cluster vs ANE rail) |
+| `data.txt` | Collected benchmark runs (GEMM, inference, thermal stress) with plain-language interpretations. Device unconfirmed (likely M4) |
 
 ## Commands
 

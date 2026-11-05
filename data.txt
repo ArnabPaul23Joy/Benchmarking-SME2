@@ -1,0 +1,168 @@
+================================================================================
+SME2Inference — Collected Benchmark Data & Interpretations
+================================================================================
+Compiled: 2026-11-04
+Device for all runs below: unconfirmed (SME2=true). The fp32 numbers match the
+M4 Mac baseline (~1779 GFLOPS peak), so these are almost certainly from the
+actively-cooled M4 Mac, NOT the iPhone 17 Pro. Confirm before promoting to the
+baseline table in CLAUDE.md.
+
+Units under test:
+  SME2       = hand-written FMOPA/SMOPA matrix-engine kernels (sme_kernels.c)
+  NEON       = classic 1-D vector baseline (FMLA / SDOT)
+  Accelerate = Apple's cblas_sgemm (appears to use SME internally)
+  ANE        = Apple Neural Engine via Core ML (.cpuAndNeuralEngine)
+
+Higher GFLOPS/GOPS = better. Lower milliseconds = better.
+
+
+================================================================================
+1. RAW GEMM BENCHMARK  (C = A·B, one core)
+================================================================================
+
+fp32 (GFLOPS)
+| Matrix size | SME2 (ms / GFLOPS) | NEON (ms / GFLOPS) | Accelerate (ms / GFLOPS) |
+|-------------|--------------------|--------------------|--------------------------|
+| 256²        | 0.027 / 1251       | 0.310 / 108        | 0.029 / 1162             |
+| 512²        | 0.172 / 1560       | 2.438 / 110        | 0.185 / 1448             |
+| 1024²       | 1.249 / 1720       | 20.686 / 104       | 1.201 / 1789             |
+| 2048²       | 11.408 / 1506      | 180.975 / 95       | 9.482 / 1812             |
+
+int8 (GOPS)
+| Matrix size | SME2 (ms / GOPS)   | NEON (ms / GOPS)   |
+|-------------|--------------------|--------------------|
+| 256²        | 0.014 / 2379       | 0.081 / 412        |
+| 512²        | 0.081 / 3326       | 0.611 / 440        |
+| 1024²       | 0.559 / 3844       | 4.832 / 444        |
+| 2048²       | 4.389 / 3915       | 40.728 / 422       |
+
+Correctness (all sizes): NEON vs Accelerate max |Δ| = 0.00e+00;
+SME2 vs Accelerate max |Δ| = 0.00e+00; int8 SME2 matches NEON exactly.
+
+Interpretation (plain terms)
+  - The matrix engine beats plain vector code by ~16-19x (1024²: SME2 1720 vs
+    NEON 104 GFLOPS). NEON multiplies one row-by-vector at a time; SME2 computes
+    a whole 16x16 tile of the answer in a single FMOPA instruction.
+  - SME2 ≈ Accelerate at every size, and their outputs are BIT-FOR-BIT identical
+    (Δ = 0.00). Strong evidence Apple's Accelerate library uses the same SME
+    hardware under the hood — we independently matched what Apple ships.
+  - int8 is ~2x faster than fp32 (1024²: 3844 GOPS vs 1720 GFLOPS) because 8-bit
+    values pack ~4x denser through the engine. Integer math has no rounding, so
+    SME2 matching NEON exactly confirms the int8 kernel is correct.
+  - Performance peaks at 1024² then dips at 2048²: the matrices stop fitting in
+    cache, so the chip waits on memory (the "memory wall"). Accelerate dips less
+    at 2048² (1812 vs 1506), suggesting Apple does smarter cache-blocking there.
+
+
+================================================================================
+2. NEURAL-NETWORK INFERENCE BENCHMARK
+================================================================================
+Model: MLP 1024 -> 2048 -> 2048 -> 1024 -> 16, ReLU, 8,410,128 parameters.
+
+| Batch | SME2 (ms / GFLOPS) | NEON (ms / GFLOPS) | Accelerate (ms / GFLOPS) | GFLOP/batch |
+|-------|--------------------|--------------------|--------------------------|-------------|
+| 1     | 0.639 / 26         | 1.328 / 13         | 0.458 / 37               | 0.02        |
+| 8     | 0.568 / 237        | 1.442 / 93         | 0.894 / 150              | 0.13        |
+| 32    | 0.705 / 763        | 5.333 / 101        | 1.126 / 478              | 0.54        |
+| 128   | 2.041 / 1054       | 21.421 / 100       | 2.347 / 917              | 2.15        |
+
+Correctness: SME2 vs Accelerate max |Δ| ≈ 2.5e-06 – 3.3e-06; top-1 agreement
+N/N at every batch (same predicted class for all samples).
+
+Winner by batch:
+  batch 1   -> Accelerate (SME2 loses)
+  batch 8   -> SME2
+  batch 32  -> SME2 (1.6x faster than Accelerate)
+  batch 128 -> SME2
+
+Interpretation (plain terms)
+  - Key fact: the matrix engine always computes a 32-row-tall tile at once, so
+    "batch size" = how many of those 32 rows carry real data.
+      batch 1  -> 1/32 rows used (~3% full) -> 31/32 of the work is padding
+      batch 8  -> 8/32 (25%)
+      batch 32 -> 32/32 (100% full, zero wasted work)
+      batch 128-> four full 32-row blocks
+  - So SME2 throughput scales ~40x from batch 1 (26 GFLOPS) to batch 128
+    (1054 GFLOPS) purely by filling the block — the chip didn't change, we just
+    stopped wasting it on padding.
+  - Crossover at ~batch 8: below it, a single sample barely fills the engine and
+    Accelerate wins; at/above it, SME2 wins and the lead grows.
+  - NEON stays flat (~100 GFLOPS) regardless of batch: a 1-D vector unit can't
+    exploit batching the way the 2-D matrix engine can.
+  - Practical rule: single sample at a time -> use Accelerate/NEON.
+    Batched (8+ samples) -> use SME2.
+  - Caveat: tiny workload (<2 ms); batch-1 GFLOPS understates the engine because
+    fixed overhead dominates. Batch-128 (1054 GFLOPS) is the honest sustained number.
+
+
+================================================================================
+3. THERMAL / SUSTAINED-LOAD STRESS TEST  (per unit, 30 s each)
+================================================================================
+Each unit driven flat-out; throughput + ProcessInfo.thermalState sampled every ~1 s.
+SME2 & NEON run a 1024² fp32 GEMM; ANE runs the Core ML MLP at batch 32.
+
+Summary
+| Unit | Peak GFLOPS | End GFLOPS | Throttle | Thermal (start -> max) |
+|------|-------------|------------|----------|------------------------|
+| SME2 | 1779        | 1538       | 13.6%    | nominal -> nominal     |
+| NEON | 89          | 88         | 0.6%     | nominal -> nominal     |
+| ANE  | 1067        | 1018       | 4.6%     | nominal -> nominal     |
+
+SME2 curve (GFLOPS, 1s..30s): 1779 1777 1733 1706 1679 1667 1655 1644 1631 1627
+  1619 1613 1607 1603 1599 1590 1589 1583 1579 1572 1570 1563 1562 1558 1556
+  1551 1548 1543 1537 1538
+NEON curve: flat at 88-89 GFLOPS the whole 30 s.
+ANE curve (GFLOPS, 1s..30s): 1061 1067 1066 1066 1055 1046 1040 1035 1036 1036
+  1036 1035 1034 1033 1031 1027 1025 1026 1025 1025 1023 1025 1024 1021 1019
+  1017 1014 1014 1018 1018
+
+Interpretation (plain terms)
+  - IMPORTANT: thermalState stayed "nominal" on all three units the whole time,
+    so the "throttle %" here is NOT heat. It is boost-clock settling — the core
+    starts on a high turbo clock and eases to its sustained clock. Real thermal
+    throttling would show the thermal state rising to fair/serious.
+  - The clock back-off is still a useful PROXY FOR POWER draw. Ranking of strain:
+        SME2 (13.6%)  >  ANE (4.6%)  >  NEON (0.6%)
+    i.e. SME2 pulls the most power (biggest clock drop), NEON the least.
+  - Judged on heat+power ALONE, NEON looks best (coolest) — but only because it
+    does ~17x less work (88 vs 1538 GFLOPS). That is low strain, low value.
+  - Judged on work-per-strain (the meaningful efficiency metric):
+        ANE  ~221 GFLOPS per 1% throttle   <- best
+        NEON ~147
+        SME2 ~113
+    So the ANE is the most efficient: ~1000 GFLOPS with almost no clock back-off,
+    exactly what a perf-per-watt NPU is built for.
+  - Sustained vs peak: SME2's honest sustained number is ~1540 GFLOPS (not the
+    1779 first-second burst), still ~17.5x NEON at steady state.
+
+Verdict
+  - Need efficiency (heat + power)  -> ANE  (Neural Engine)
+  - Need peak speed                 -> SME2 (hottest / highest power, fastest)
+  - Need to sip power on light work  -> NEON (coolest, but low throughput)
+
+Caveats
+  - thermalState is coarse (nominal/fair/serious/critical) and system-wide; we
+    attribute it per-unit by stressing one unit at a time.
+  - Almost certainly the actively-cooled M4 Mac, so nothing ever left "nominal".
+    To capture a REAL thermal signature, run the 120 s test on the passively-
+    cooled iPhone 17 Pro — SME2 is expected to reach fair/serious and show a
+    genuine stepped throttle.
+  - These are throttle/throughput numbers, a PROXY for power. For real watts/
+    joules, run Tools/measure_power.sh on an M4 Mac (powermetrics): SME2/NEON
+    appear as CPU-cluster power, ANE as its own rail. joules/inference =
+    avg power x seconds/inference.
+
+
+================================================================================
+4. HEADLINE TAKEAWAYS
+================================================================================
+  1. SME2 (matrix engine) is ~16-19x faster than NEON and matches Apple's own
+     Accelerate library bit-for-bit — evidence Accelerate already uses SME.
+  2. SME2 only pays off on batched/matrix-shaped work: at batch 1 it mostly
+     multiplies padding and Accelerate wins; from batch 8 up, SME2 wins.
+  3. int8 roughly doubles throughput over fp32 on SME2 (~3900 GOPS).
+  4. Efficiency ranking (proxy, M4): ANE most efficient per unit of power, NEON
+     coolest but slow, SME2 fastest but highest power/heat.
+  5. Still TODO: confirm the device; run on a real iPhone 17 Pro; get true watts
+     via powermetrics; run the 120 s thermal test under passive cooling.
+================================================================================
